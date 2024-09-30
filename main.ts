@@ -208,7 +208,7 @@ export default class DriveUploader extends Plugin {
 
 			for (const file of Array.from(files)) {
 
-				this.uploadFileToDrive(file);
+				await this.uploadFileToDrive(file);
 
 				const fileInVault = this.app.vault.getAbstractFileByPath(`${file.name}`)
 				const filePath = `${this.settings.fileDirectory}/${file.name}`
@@ -226,6 +226,8 @@ export default class DriveUploader extends Plugin {
 
 	async syncFiles() {
 
+		console.log("sync_run")
+
 		const clientId = this.settings.clientId;
 		const clientSecret = this.settings.clientSecret;
 		const redirectUri = this.settings.redirectUri;
@@ -242,12 +244,15 @@ export default class DriveUploader extends Plugin {
 			fields: 'files(id, name)'
 		})).data.files as drive_v3.Schema$File[];
 
-
 		const vaultFiles = this.listFilesInFolder(this.settings.fileDirectory);
 
-		for (const file of driveFiles) {
-			if (!vaultFiles.find(vaultFile => vaultFile.name === file.name)) {
-				this.uploadFileToDrive((file as unknown) as File);
+		for (const file of vaultFiles) {
+			if (!driveFiles.find(driveFile => driveFile.name === file.name)) {
+				console.log("noticed");
+				const fileContents = await this.app.vault.read(file);
+				const blob = new Blob([fileContents], { type: this.getMimeType(file)});
+				const convertedFile = new File([blob], file.name, { type: blob.type, lastModified: file.stat.mtime });
+				this.uploadFileToDrive(convertedFile);
 			}
 		}
 	}
@@ -271,6 +276,33 @@ export default class DriveUploader extends Plugin {
 			console.error("The specified folder does not exist or is not a folder.");
 			return [];
 		}
+	}
+
+	private getMimeType(tfile: TFile): string {
+
+		const extension = tfile.extension.toLowerCase();
+	
+		const mimeTypes: Record<string, string> = {
+			"txt": "text/plain",
+			"md": "text/markdown",
+			"html": "text/html",
+			"css": "text/css",
+			"js": "application/javascript",
+			"json": "application/json",
+			"xml": "application/xml",
+			"jpg": "image/jpeg",
+			"jpeg": "image/jpeg",
+			"png": "image/png",
+			"gif": "image/gif",
+			"svg": "image/svg+xml",
+			"pdf": "application/pdf",
+			"zip": "application/zip",
+			"rar": "application/vnd.rar",
+			"mp3": "audio/mpeg",
+			"mp4": "video/mp4",
+		};
+	
+		return mimeTypes[extension] || "application/octet-stream"; 
 	}
 
 	async loadSettings() {
