@@ -1,85 +1,316 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { App, Editor, MarkdownEditView, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, setIcon, Setting, TAbstractFile, TextComponent, TFile, TFolder } from 'obsidian';
+import { OAuth2Client } from 'google-auth-library'
+import { drive_v3, google } from "googleapis"
 
-// Remember to rename these classes and interfaces!
+type OnSubmitCallback = (value: string) => void;
 
-interface MyPluginSettings {
-	mySetting: string;
+interface DriveUploaderSettings {
+	clientId: string;
+	clientSecret: string;
+	redirectUri: string;
+	authorizationCode: string;
+	accessToken: string;
+	refreshToken: string;
+	folderId: string;
+	fileDirectory: string;
+	bannedFileExtensions: string[];
+	isDeleteFromDriveEnabled: boolean;
 }
 
-const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
+const DEFAULT_SETTINGS: DriveUploaderSettings = {
+	clientId: "",
+	clientSecret: "",
+	redirectUri: "urn:ietf:wg:oauth:2.0:oob",
+	authorizationCode: "",
+	accessToken: "",
+	refreshToken: "",
+	folderId: "",
+	fileDirectory: ".",
+	bannedFileExtensions: [""],
+	isDeleteFromDriveEnabled: false
 }
 
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+const wrapTextWithPasswordHide = (text: TextComponent) => {
+	const hider = text.inputEl.insertAdjacentElement("beforebegin", createSpan());
+	if (!hider) {
+		return
+	}
+	setIcon(hider as HTMLElement, 'eye-off');
+
+	hider.addEventListener("click", () => {
+		const isText = text.inputEl.getAttribute("type") === "text";
+		if (isText) {
+			setIcon(hider as HTMLElement, 'eye-off');
+			text.inputEl.setAttribute("type", "password");
+		} else {
+			setIcon(hider as HTMLElement, 'eye')
+			text.inputEl.setAttribute("type", "text");
+		}
+		text.inputEl.focus();
+	});
+	text.inputEl.setAttribute("type", "password");
+	return text;
+};
+
+export default class DriveUploader extends Plugin {
+
+	settings: DriveUploaderSettings;
+	oauth2Client: OAuth2Client;
+	isAuth: boolean;
 
 	async onload() {
+
 		await this.loadSettings();
 
-		// This creates an icon in the left ribbon.
-		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
-		// Perform additional things with the ribbon
-		ribbonIconEl.addClass('my-plugin-ribbon-class');
+		this.addSettingTab(new DriveUploaderSettingsTab(this.app, this));
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status Bar Text');
-
-		// This adds a simple command that can be triggered anywhere
 		this.addCommand({
-			id: 'open-sample-modal-simple',
-			name: 'Open sample modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			}
+			id: 'drive_uploader',
+			name: 'File upload',
+			icon: 'upload-cloud',
+			editorCallback: (editor: Editor) => {
+				this.authenticateUser();
+			},
 		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'sample-editor-command',
-			name: 'Sample editor command',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				console.log(editor.getSelection());
-				editor.replaceSelection('Sample Editor Command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-sample-modal-complex',
-			name: 'Open sample modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
 
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
+		this.registerEvent(
+			this.app.vault.on("delete", (file) => {
+				if (this.settings.isDeleteFromDriveEnabled) {
+					this.deleteFileFromDrive(file);
 				}
-			}
-		});
+			})
+		)
+		this.registerEvent(this.app.workspace.on("editor-paste", this.handleUpload.bind(this)));
+		this.registerEvent(this.app.workspace.on("editor-drop", this.handleUpload.bind(this)));
 
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			console.log('click', evt);
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
+		if (this.settings.accessToken && this.settings.refreshToken) {
+			this.syncFiles();
+			new Notice("App is already authenticated to Google Drive")
+		}
 	}
 
-	onunload() {
+	async authenticateUser() {
 
+		const clientId = this.settings.clientId;
+		const clientSecret = this.settings.clientSecret;
+		const redirectUri = this.settings.redirectUri;
+
+		if (clientId === "" || clientSecret === "") {
+			new Notice('Invalid client data, please insert propper client id and client secret');
+			return;
+		}
+
+		this.oauth2Client = new OAuth2Client(clientId, clientSecret, redirectUri);
+
+		const authUrl = this.oauth2Client.generateAuthUrl({
+			access_type: 'offline',
+			scope: ['https://www.googleapis.com/auth/drive.file'],
+		});
+
+		window.open(authUrl);
+
+		new AuthModal(this.app, async (authCode: string) => {
+
+			this.settings.authorizationCode = authCode;
+
+			if (authCode) {
+				try {
+					const { tokens } = await this.oauth2Client.getToken(authCode);
+					this.oauth2Client.setCredentials(tokens);
+
+					this.settings.accessToken = tokens.access_token as string;
+					this.settings.refreshToken = tokens.refresh_token as string;
+					await this.saveData(this.settings);
+					this.isAuth = true;
+
+					new Notice('Authentication successful!');
+				} catch (error) {
+					console.error('Error authenticating with Google Drive:', error);
+					new Notice('Authentication failed.');
+				}
+			}
+		}).open();
+
+	}
+
+	async uploadFileToDrive(file: File) {
+
+		const clientId = this.settings.clientId;
+		const clientSecret = this.settings.clientSecret;
+		const redirectUri = this.settings.redirectUri;
+
+		this.oauth2Client = new OAuth2Client(clientId, clientSecret, redirectUri);
+		this.oauth2Client.setCredentials({
+			access_token: this.settings.accessToken,
+			refresh_token: this.settings.refreshToken,
+		});
+
+		const drive = google.drive({ version: 'v3', auth: this.oauth2Client })
+
+		try {
+
+			const uploadedFileResponse = await drive.files.create({
+				requestBody: {
+					name: file.name,
+					mimeType: file.type,
+					parents: [this.settings.folderId]
+				},
+				media: {
+					mimeType: file.type,
+					body: file.stream(),
+				},
+			});
+
+			// const webViewLink = uploadedFileResponse.data.webViewLink;
+			// const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+			// view?.editor.replaceSelection(`[DriveLink]:${webViewLink}`);
+			new Notice(`Uploaded ${file.name} to Google Drive.`);
+
+		} catch (error) {
+			console.error('Error uploading to Google Drive:', error);
+			new Notice('Failed to upload file to Google Drive.');
+		}
+
+	}
+
+	async deleteFileFromDrive(file: File | TAbstractFile) {
+
+		const clientId = this.settings.clientId;
+		const clientSecret = this.settings.clientSecret;
+		const redirectUri = this.settings.redirectUri;
+
+		this.oauth2Client = new OAuth2Client(clientId, clientSecret, redirectUri);
+		this.oauth2Client.setCredentials({
+			access_token: this.settings.accessToken,
+			refresh_token: this.settings.refreshToken,
+		});
+
+		const drive = google.drive({ version: 'v3', auth: this.oauth2Client });
+
+		try {
+			const driveFiles = (await drive.files.list({
+				q: `'${this.settings.folderId}' in parents and trashed = false`,
+				fields: 'files(id, name)'
+			})).data.files as drive_v3.Schema$File[];
+
+			const thisFile = driveFiles.find(driveFile => driveFile.name === file.name);
+
+			drive.files.delete({
+				fileId: thisFile?.id as string,
+			});
+
+			new Notice("File successfully deleted")
+		} catch (error) {
+			new Notice("File wasn't deleted")
+		}
+	}
+
+	async handleUpload(event: DragEvent) {
+
+		if (event.dataTransfer && event.dataTransfer.files.length > 0) {
+
+			const files = event.dataTransfer.files;
+
+			for (const file of Array.from(files)) {
+
+				if (this.settings.bannedFileExtensions.includes(file.name.split(".")[1])) {
+					new Notice(`The file ${file.name} cannot be uploaded to vault`);
+					continue;
+				}
+
+				await this.uploadFileToDrive(file);
+
+				const fileInVault = this.app.vault.getAbstractFileByPath(`${file.name}`)
+				const filePath = `${this.settings.fileDirectory}/${file.name}`
+
+				if (fileInVault) {
+					try {
+						await this.app.vault.rename(fileInVault, filePath);
+					} catch (error) {
+						console.error("Error moving the file:", error);
+					}
+				}
+			}
+		}
+	}
+
+	async syncFiles() {
+
+		const clientId = this.settings.clientId;
+		const clientSecret = this.settings.clientSecret;
+		const redirectUri = this.settings.redirectUri;
+
+		this.oauth2Client = new OAuth2Client(clientId, clientSecret, redirectUri);
+		this.oauth2Client.setCredentials({
+			access_token: this.settings.accessToken,
+			refresh_token: this.settings.refreshToken,
+		});
+
+		const drive = google.drive({ version: 'v3', auth: this.oauth2Client });
+		const driveFiles = (await drive.files.list({
+			q: `'${this.settings.folderId}' in parents and trashed = false`,
+			fields: 'files(id, name)'
+		})).data.files as drive_v3.Schema$File[];
+
+		const vaultFiles = this.listFilesInFolder(this.settings.fileDirectory);
+
+		for (const file of vaultFiles) {
+			if (!driveFiles.find(driveFile => driveFile.name === file.name)) {
+				console.log("noticed");
+				const fileContents = await this.app.vault.read(file);
+				const blob = new Blob([fileContents], { type: this.getMimeType(file) });
+				const convertedFile = new File([blob], file.name, { type: blob.type, lastModified: file.stat.mtime });
+				this.uploadFileToDrive(convertedFile);
+			}
+		}
+	}
+
+	private listFilesInFolder(folderPath: string) {
+
+		const folder = this.app.vault.getAbstractFileByPath(folderPath);
+
+		if (folder && folder instanceof TFolder) {
+			const files: TFile[] = [];
+
+			folder.children.forEach((item) => {
+				if (item instanceof TFile) {
+					files.push(item);
+					console.log(`File: ${item.path}`);
+				}
+			});
+
+			return files;
+		} else {
+			console.error("The specified folder does not exist or is not a folder.");
+			return [];
+		}
+	}
+
+	private getMimeType(tfile: TFile): string {
+
+		const extension = tfile.extension.toLowerCase();
+
+		const mimeTypes: Record<string, string> = {
+			"txt": "text/plain",
+			"md": "text/markdown",
+			"html": "text/html",
+			"css": "text/css",
+			"js": "application/javascript",
+			"json": "application/json",
+			"xml": "application/xml",
+			"jpg": "image/jpeg",
+			"jpeg": "image/jpeg",
+			"png": "image/png",
+			"gif": "image/gif",
+			"svg": "image/svg+xml",
+			"pdf": "application/pdf",
+			"zip": "application/zip",
+			"rar": "application/vnd.rar",
+			"mp3": "audio/mpeg",
+			"mp4": "video/mp4",
+		};
+
+		return mimeTypes[extension] || "application/octet-stream";
 	}
 
 	async loadSettings() {
@@ -91,44 +322,146 @@ export default class MyPlugin extends Plugin {
 	}
 }
 
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
-	}
+class DriveUploaderSettingsTab extends PluginSettingTab {
 
-	onOpen() {
-		const {contentEl} = this;
-		contentEl.setText('Woah!');
-	}
+	plugin: DriveUploader;
 
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
-	}
-}
-
-class SampleSettingTab extends PluginSettingTab {
-	plugin: MyPlugin;
-
-	constructor(app: App, plugin: MyPlugin) {
+	constructor(app: App, plugin: DriveUploader) {
 		super(app, plugin);
 		this.plugin = plugin;
 	}
 
 	display(): void {
-		const {containerEl} = this;
+
+		const { containerEl } = this;
 
 		containerEl.empty();
 
 		new Setting(containerEl)
-			.setName('Setting #1')
-			.setDesc('It\'s a secret')
-			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
+			.setName('Client Id')
+			.setDesc("Required")
+			.addText(text => {
+				wrapTextWithPasswordHide(text)
+				return text.setPlaceholder('Enter your client id')
+					.setValue(this.plugin.settings.clientId)
+					.onChange(async (value) => {
+						this.plugin.settings.clientId = value;
+						await this.plugin.saveSettings();
+					})
+			});
+
+		new Setting(containerEl)
+			.setName('Client Secret')
+			.setDesc("Required")
+			.addText(text => {
+				wrapTextWithPasswordHide(text)
+				return text.setPlaceholder('Enter your secret')
+					.setValue(this.plugin.settings.clientSecret)
+					.onChange(async (value) => {
+						this.plugin.settings.clientSecret = value;
+						await this.plugin.saveSettings();
+					})
+			});
+
+		new Setting(containerEl)
+			.setName('Folder Id')
+			.setDesc("Optional")
+			.addText(text => {
+				wrapTextWithPasswordHide(text)
+				return text.setPlaceholder('Enter your folder id')
+					.setValue(this.plugin.settings.folderId)
+					.onChange(async (value) => {
+						this.plugin.settings.folderId = value;
+						await this.plugin.saveSettings();
+					})
+			});
+
+		new Setting(containerEl)
+			.setName('File Directory')
+			.setDesc("Optional")
+			.addText(text => {
+				return text.setPlaceholder('Enter your file directory')
+					.setValue(this.plugin.settings.fileDirectory)
+					.onChange(async (value) => {
+						this.plugin.settings.fileDirectory = value;
+						await this.plugin.saveSettings();
+					})
+			});
+
+		containerEl.createEl("h3", { text: "Set Forbidden File Extensions" });
+		containerEl.createEl("br");
+
+		this.plugin.settings.bannedFileExtensions.forEach((ex, index) => {
+			new Setting(containerEl)
+				.setName(`Extension ${index + 1}`)
+				.addText(text => text
+					.setPlaceholder('Name (optional)')
+					.setValue(ex)
+					.onChange(async (value) => {
+						this.plugin.settings.bannedFileExtensions[index] = value;
+						await this.plugin.saveSettings();
+					})
+				)
+				.addExtraButton(button => {
+					button.setIcon('trash')
+						.setTooltip('Delete filter')
+						.onClick(async () => {
+							this.plugin.settings.bannedFileExtensions.splice(index, 1);
+							await this.plugin.saveSettings();
+							this.display();
+						});
+				});
+		});
+
+		new Setting(containerEl)
+			.addButton(button => {
+				button.setButtonText('Add new pin filter for tags')
+					.setCta()
+					.onClick(() => {
+						this.plugin.settings.bannedFileExtensions.push("");
+						this.plugin.saveSettings();
+						this.display();
+					});
+			});
+
+		new Setting(containerEl)
+			.setName('Delete From Drive when the file is deleted from vault')
+			.setDesc('When the file gets deleted from vault, it will authomatically get deleted from drive')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.isDeleteFromDriveEnabled)
 				.onChange(async (value) => {
-					this.plugin.settings.mySetting = value;
+					this.plugin.settings.isDeleteFromDriveEnabled = value;
 					await this.plugin.saveSettings();
-				}));
+				})
+			);
+	}
+}
+
+class AuthModal extends Modal {
+
+	private onSubmit: OnSubmitCallback;
+
+	constructor(app: App, onSubmit: OnSubmitCallback) {
+		super(app);
+		this.onSubmit = onSubmit;
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		contentEl.createEl("h2", { text: "Enter your Google authorization code:" });
+		const inputEl = contentEl.createEl("input", {
+			type: "text",
+			placeholder: "Paste your code here...",
+		});
+		const submitButton = contentEl.createEl("button", { text: "Submit" });
+		submitButton.addEventListener("click", () => {
+			this.onSubmit(inputEl.value);
+			this.close();
+		});
+	}
+
+	onClose(): void {
+		const { contentEl } = this;
+		contentEl.empty();
 	}
 }
