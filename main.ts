@@ -1,4 +1,4 @@
-import { App, Editor, Modal, Notice, Plugin, PluginSettingTab, setIcon, Setting, TAbstractFile, TextComponent, TFile, TFolder } from 'obsidian';
+import { App, Editor, MarkdownEditView, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, setIcon, Setting, TAbstractFile, TextComponent, TFile, TFolder } from 'obsidian';
 import { OAuth2Client } from 'google-auth-library'
 import { drive_v3, google } from "googleapis"
 
@@ -13,6 +13,8 @@ interface DriveUploaderSettings {
 	refreshToken: string;
 	folderId: string;
 	fileDirectory: string;
+	bannedFileExtensions: string[];
+	isDeleteFromDriveEnabled: boolean;
 }
 
 const DEFAULT_SETTINGS: DriveUploaderSettings = {
@@ -23,7 +25,9 @@ const DEFAULT_SETTINGS: DriveUploaderSettings = {
 	accessToken: "",
 	refreshToken: "",
 	folderId: "",
-	fileDirectory: "."
+	fileDirectory: ".",
+	bannedFileExtensions: [""],
+	isDeleteFromDriveEnabled: false
 }
 
 const wrapTextWithPasswordHide = (text: TextComponent) => {
@@ -58,8 +62,6 @@ export default class DriveUploader extends Plugin {
 
 		await this.loadSettings();
 
-		this.syncFiles();
-
 		this.addSettingTab(new DriveUploaderSettingsTab(this.app, this));
 
 		this.addCommand({
@@ -73,14 +75,16 @@ export default class DriveUploader extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on("delete", (file) => {
-				console.log("File Deleted", file.name);
-				this.deleteFileFromDrive(file);
+				if (this.settings.isDeleteFromDriveEnabled) {
+					this.deleteFileFromDrive(file);
+				}
 			})
 		)
 		this.registerEvent(this.app.workspace.on("editor-paste", this.handleUpload.bind(this)));
 		this.registerEvent(this.app.workspace.on("editor-drop", this.handleUpload.bind(this)));
 
 		if (this.settings.accessToken && this.settings.refreshToken) {
+			this.syncFiles();
 			new Notice("App is already authenticated to Google Drive")
 		}
 	}
@@ -105,7 +109,7 @@ export default class DriveUploader extends Plugin {
 
 		window.open(authUrl);
 
-		new CustomPromptModal(this.app, async (authCode: string) => {
+		new AuthModal(this.app, async (authCode: string) => {
 
 			this.settings.authorizationCode = authCode;
 
@@ -131,8 +135,6 @@ export default class DriveUploader extends Plugin {
 
 	async uploadFileToDrive(file: File) {
 
-		console.log(file.stream())
-
 		const clientId = this.settings.clientId;
 		const clientSecret = this.settings.clientSecret;
 		const redirectUri = this.settings.redirectUri;
@@ -147,7 +149,7 @@ export default class DriveUploader extends Plugin {
 
 		try {
 
-			await drive.files.create({
+			const uploadedFileResponse = await drive.files.create({
 				requestBody: {
 					name: file.name,
 					mimeType: file.type,
@@ -159,6 +161,9 @@ export default class DriveUploader extends Plugin {
 				},
 			});
 
+			// const webViewLink = uploadedFileResponse.data.webViewLink;
+			// const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+			// view?.editor.replaceSelection(`[DriveLink]:${webViewLink}`);
 			new Notice(`Uploaded ${file.name} to Google Drive.`);
 
 		} catch (error) {
@@ -191,8 +196,8 @@ export default class DriveUploader extends Plugin {
 			const thisFile = driveFiles.find(driveFile => driveFile.name === file.name);
 
 			drive.files.delete({
-                fileId: thisFile?.id as string,
-            });
+				fileId: thisFile?.id as string,
+			});
 
 			new Notice("File successfully deleted")
 		} catch (error) {
@@ -207,6 +212,11 @@ export default class DriveUploader extends Plugin {
 			const files = event.dataTransfer.files;
 
 			for (const file of Array.from(files)) {
+
+				if (this.settings.bannedFileExtensions.includes(file.name.split(".")[1])) {
+					new Notice(`The file ${file.name} cannot be uploaded to vault`);
+					continue;
+				}
 
 				await this.uploadFileToDrive(file);
 
@@ -225,8 +235,6 @@ export default class DriveUploader extends Plugin {
 	}
 
 	async syncFiles() {
-
-		console.log("sync_run")
 
 		const clientId = this.settings.clientId;
 		const clientSecret = this.settings.clientSecret;
@@ -250,7 +258,7 @@ export default class DriveUploader extends Plugin {
 			if (!driveFiles.find(driveFile => driveFile.name === file.name)) {
 				console.log("noticed");
 				const fileContents = await this.app.vault.read(file);
-				const blob = new Blob([fileContents], { type: this.getMimeType(file)});
+				const blob = new Blob([fileContents], { type: this.getMimeType(file) });
 				const convertedFile = new File([blob], file.name, { type: blob.type, lastModified: file.stat.mtime });
 				this.uploadFileToDrive(convertedFile);
 			}
@@ -281,7 +289,7 @@ export default class DriveUploader extends Plugin {
 	private getMimeType(tfile: TFile): string {
 
 		const extension = tfile.extension.toLowerCase();
-	
+
 		const mimeTypes: Record<string, string> = {
 			"txt": "text/plain",
 			"md": "text/markdown",
@@ -301,8 +309,8 @@ export default class DriveUploader extends Plugin {
 			"mp3": "audio/mpeg",
 			"mp4": "video/mp4",
 		};
-	
-		return mimeTypes[extension] || "application/octet-stream"; 
+
+		return mimeTypes[extension] || "application/octet-stream";
 	}
 
 	async loadSettings() {
@@ -372,7 +380,6 @@ class DriveUploaderSettingsTab extends PluginSettingTab {
 			.setName('File Directory')
 			.setDesc("Optional")
 			.addText(text => {
-				wrapTextWithPasswordHide(text)
 				return text.setPlaceholder('Enter your file directory')
 					.setValue(this.plugin.settings.fileDirectory)
 					.onChange(async (value) => {
@@ -380,10 +387,57 @@ class DriveUploaderSettingsTab extends PluginSettingTab {
 						await this.plugin.saveSettings();
 					})
 			});
+
+		containerEl.createEl("h3", { text: "Set Forbidden File Extensions" });
+		containerEl.createEl("br");
+
+		this.plugin.settings.bannedFileExtensions.forEach((ex, index) => {
+			new Setting(containerEl)
+				.setName(`Extension ${index + 1}`)
+				.addText(text => text
+					.setPlaceholder('Name (optional)')
+					.setValue(ex)
+					.onChange(async (value) => {
+						this.plugin.settings.bannedFileExtensions[index] = value;
+						await this.plugin.saveSettings();
+					})
+				)
+				.addExtraButton(button => {
+					button.setIcon('trash')
+						.setTooltip('Delete filter')
+						.onClick(async () => {
+							this.plugin.settings.bannedFileExtensions.splice(index, 1);
+							await this.plugin.saveSettings();
+							this.display();
+						});
+				});
+		});
+
+		new Setting(containerEl)
+			.addButton(button => {
+				button.setButtonText('Add new pin filter for tags')
+					.setCta()
+					.onClick(() => {
+						this.plugin.settings.bannedFileExtensions.push("");
+						this.plugin.saveSettings();
+						this.display();
+					});
+			});
+
+		new Setting(containerEl)
+			.setName('Delete From Drive when the file is deleted from vault')
+			.setDesc('When the file gets deleted from vault, it will authomatically get deleted from drive')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.isDeleteFromDriveEnabled)
+				.onChange(async (value) => {
+					this.plugin.settings.isDeleteFromDriveEnabled = value;
+					await this.plugin.saveSettings();
+				})
+			);
 	}
 }
 
-class CustomPromptModal extends Modal {
+class AuthModal extends Modal {
 
 	private onSubmit: OnSubmitCallback;
 
